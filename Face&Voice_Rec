@@ -1,0 +1,815 @@
+# Work
+# app.py – Complete FastAPI App with Colorful UI (Fixed)
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
+import json, base64, cv2, numpy as np, uuid, asyncio, time
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI()
+
+# Global sessions dictionary
+sessions = {}
+
+# Import voice processing libraries with error handling
+try:
+    from resemblyzer import VoiceEncoder
+    from sklearn.cluster import DBSCAN
+    VOICE_PROCESSING_AVAILABLE = True
+except ImportError as e:
+    logger.warning(f"Voice processing libraries not available: {e}")
+    VOICE_PROCESSING_AVAILABLE = False
+
+async def count_unique_voices(audio_segments):
+    """Count unique voices in audio segments using voice embeddings"""
+    if not VOICE_PROCESSING_AVAILABLE:
+        logger.warning("Voice processing not available, using simple detection")
+        # Fallback: count based on audio activity patterns
+        if not audio_segments:
+            return 0
+        
+        # Simple voice activity detection based on audio energy
+        active_segments = 0
+        for segment in audio_segments[-50:]:  # Check last 50 segments
+            if segment:
+                audio_np = np.array(segment, dtype=np.float32)
+                if len(audio_np) > 1000:  # Minimum length check
+                    energy = np.mean(audio_np ** 2)
+                    if energy > 0.001:  # Energy threshold for voice activity
+                        active_segments += 1
+        
+        # Estimate voices based on activity (rough approximation)
+        if active_segments > 20:
+            return min(2, active_segments // 15)  # Estimate max 2 voices
+        elif active_segments > 5:
+            return 1
+        else:
+            return 0
+    
+    try:
+        encoder = VoiceEncoder()
+        embeds = []
+        
+        # Process more segments for better accuracy
+        segments_to_process = audio_segments[-100:] if len(audio_segments) > 100 else audio_segments
+        
+        for segment in segments_to_process:
+            if not segment:
+                continue
+                
+            audio_np = np.array(segment, dtype=np.float32)
+            
+            # Skip if segment too short (need at least 0.5 second at 16kHz)  
+            if len(audio_np) < 8000:
+                continue
+            
+            # Check for voice activity (energy-based)
+            energy = np.mean(audio_np ** 2)
+            if energy < 0.0001:  # Skip silent segments
+                continue
+            
+            # Normalize audio
+            max_val = np.max(np.abs(audio_np))
+            if max_val > 0:
+                audio_np = audio_np / max_val
+            
+            # Check for invalid values
+            if np.any(np.isnan(audio_np)) or np.any(np.isinf(audio_np)):
+                continue
+            
+            try:
+                # Get voice embedding
+                embed = encoder.embed_utterance(audio_np)
+                if embed is not None and not np.any(np.isnan(embed)) and not np.any(np.isinf(embed)):
+                    embeds.append(embed)
+            except Exception as e:
+                logger.debug(f"Embedding failed for segment: {e}")
+                continue
+        
+        # Need at least 3 embeddings for reliable clustering
+        if len(embeds) < 3:
+            return min(len(embeds), 1) if embeds else 0
+        
+        # Cluster voices using DBSCAN with adjusted parameters
+        clustering = DBSCAN(eps=0.4, min_samples=3).fit(embeds)
+        labels = clustering.labels_
+        
+        # Count unique clusters (excluding noise points -1)
+        unique_voices = len(set(labels) - {-1})
+        
+        # If no clusters found, assume at least 1 voice if we have embeddings
+        if unique_voices == 0 and len(embeds) > 0:
+            unique_voices = 1
+            
+        return min(unique_voices, 4)  # Cap at 4 voices for practical purposes
+        
+    except Exception as e:
+        logger.error(f"Voice clustering failed: {e}")
+        # Fallback to simple detection
+        return 1 if len(audio_segments) > 10 else 0
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    """WebSocket endpoint for real-time face and voice processing"""
+    await websocket.accept()
+    user_id = str(uuid.uuid4())[:8]
+    sessions[user_id] = {"faces": [], "audio": [], "last_frame_time": 0}
+    
+    logger.info(f"User {user_id} connected")
+
+    try:
+        while True:
+            msg = await websocket.receive_text()
+            data = json.loads(msg)
+
+            if data.get("type") == "video_frame":
+                # Throttle video processing to prevent overload
+                current_time = time.time()
+                if current_time - sessions[user_id]["last_frame_time"] < 0.1:  # Max 10 FPS
+                    continue
+                sessions[user_id]["last_frame_time"] = current_time
+                
+                try:
+                    # Decode base64 image
+                    img_data = base64.b64decode(data["data"].split(",")[1])
+                    frame = cv2.imdecode(np.frombuffer(img_data, np.uint8), cv2.IMREAD_COLOR)
+                    
+                    if frame is None:
+                        logger.warning("Failed to decode frame")
+                        continue
+                    
+                    # Convert to grayscale for face detection
+                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    
+                    # Improve image quality for better detection
+                    gray = cv2.equalizeHist(gray)
+                    
+                    # Load face cascade classifier
+                    face_cascade = cv2.CascadeClassifier(
+                        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+                    )
+                    
+                    # Primary face detection with balanced parameters
+                    faces = face_cascade.detectMultiScale(
+                        gray, 
+                        scaleFactor=1.1,    # Good balance of speed and accuracy
+                        minNeighbors=5,     # Reasonable neighbor requirement
+                        minSize=(40, 40),   # Smaller minimum for distant faces
+                        maxSize=(300, 300), # Keep max size limit
+                        flags=cv2.CASCADE_SCALE_IMAGE
+                    )
+                    
+                    # Simple but effective validation
+                    valid_faces = []
+                    for (x, y, w, h) in faces:
+                        # Basic aspect ratio check (human faces)
+                        aspect_ratio = w / h
+                        if 0.6 <= aspect_ratio <= 1.5:  # More lenient range
+                            # Check for reasonable texture (not completely flat)
+                            face_region = gray[y:y+h, x:x+w]
+                            if face_region.size > 0:
+                                std_dev = np.std(face_region)
+                                if std_dev > 10:  # Lower threshold for better detection
+                                    # Check if face region isn't too dark or too bright
+                                    mean_val = np.mean(face_region)
+                                    if 20 <= mean_val <= 230:
+                                        valid_faces.append((x, y, w, h))
+                    
+                    # If no faces found with strict parameters, try more lenient detection
+                    if len(valid_faces) == 0:
+                        backup_faces = face_cascade.detectMultiScale(
+                            gray,
+                            scaleFactor=1.05,
+                            minNeighbors=3,     # Lower neighbor requirement
+                            minSize=(30, 30),   # Even smaller minimum
+                            maxSize=(350, 350),
+                            flags=cv2.CASCADE_SCALE_IMAGE
+                        )
+                        
+                        # Apply basic validation to backup detection
+                        for (x, y, w, h) in backup_faces:
+                            aspect_ratio = w / h
+                            if 0.5 <= aspect_ratio <= 2.0:  # Very lenient
+                                face_region = gray[y:y+h, x:x+w]
+                                if face_region.size > 0 and np.std(face_region) > 8:
+                                    valid_faces.append((x, y, w, h))
+                    
+                    faces = valid_faces
+                    
+                    # Always draw a processing indicator box in the top-left corner
+                    cv2.rectangle(frame, (10, 10), (200, 60), (0, 255, 255), 2)
+                    cv2.putText(frame, "PROCESSING", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                    cv2.putText(frame, f"Faces: {len(faces)}", (15, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                    
+                    # Draw rectangles around detected faces
+                    for i, (x, y, w, h) in enumerate(faces):
+                        # Use different bright colors for multiple faces
+                        colors = [(0, 255, 0), (255, 0, 0), (0, 0, 255), (255, 255, 0), (255, 0, 255)]
+                        color = colors[i % len(colors)]
+                        
+                        # Draw thicker, more visible rectangle
+                        cv2.rectangle(frame, (x, y), (x+w, y+h), color, 4)
+                        
+                        # Add face label with background for better visibility
+                        label = f"Face {i+1}"
+                        label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
+                        cv2.rectangle(frame, (x, y-35), (x + label_size[0] + 10, y), color, -1)
+                        cv2.putText(frame, label, (x + 5, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
+                    
+                    # If no faces detected, show a "scanning" indicator
+                    if len(faces) == 0:
+                        cv2.putText(frame, "Scanning for faces...", (50, frame.shape[0] - 30), 
+                                  cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                    
+                    # Store face count
+                    sessions[user_id]["faces"].append(len(faces))
+                    
+                    # Encode processed frame with consistent quality
+                    encode_params = [cv2.IMWRITE_JPEG_QUALITY, 85]
+                    _, buffer = cv2.imencode('.jpg', frame, encode_params)
+                    processed = base64.b64encode(buffer).decode('utf-8')
+                    
+                    # Send processed frame back
+                    await websocket.send_text(json.dumps({
+                        "type": "video_result",
+                        "processed_frame": f"data:image/jpeg;base64,{processed}",
+                        "face_count": len(faces),
+                        "timestamp": current_time
+                    }))
+                    
+                except Exception as e:
+                    logger.error(f"Video processing error: {e}")
+
+            elif data.get("type") == "audio_data":
+                # Store audio data with validation (limit buffer size)
+                audio_data = data.get("data")
+                if audio_data and len(audio_data) > 100:  # Only store non-empty, meaningful segments
+                    if len(sessions[user_id]["audio"]) > 200:  # Keep last 200 segments
+                        sessions[user_id]["audio"] = sessions[user_id]["audio"][-100:]
+                    sessions[user_id]["audio"].append(audio_data)
+
+            elif data.get("type") == "get_results":
+                try:
+                    face_history = sessions[user_id]["faces"]
+                    faces_max = max(face_history) if face_history else 0
+                    
+                    # Count unique voices (this may take a moment)
+                    voice_count = await count_unique_voices(sessions[user_id]["audio"])
+                    
+                    await websocket.send_text(json.dumps({
+                        "type": "analysis_results",
+                        "user_id": user_id,
+                        "max_faces": faces_max,
+                        "voice_count": voice_count
+                    }))
+                except Exception as e:
+                    logger.error(f"Analysis error: {e}")
+                    await websocket.send_text(json.dumps({
+                        "type": "error",
+                        "message": "Analysis failed"
+                    }))
+
+    except WebSocketDisconnect:
+        logger.info(f"User {user_id} disconnected")
+        if user_id in sessions:
+            del sessions[user_id]
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
+        if user_id in sessions:
+            del sessions[user_id]
+
+@app.get("/")
+async def homepage():
+    """Serve the main HTML page"""
+    return HTMLResponse(html_content)
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "active_sessions": len(sessions),
+        "voice_processing": VOICE_PROCESSING_AVAILABLE
+    }
+
+html_content = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Face & Voice Recognition</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: #fff;
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            text-align: center;
+        }
+        
+        h1 {
+            font-size: 2.5em;
+            margin-bottom: 30px;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+        }
+        
+        .video-container {
+            display: flex;
+            justify-content: center;
+            gap: 20px;
+            margin-bottom: 30px;
+            flex-wrap: wrap;
+        }
+        
+        video, #processed {
+            width: 100%;
+            max-width: 400px;
+            border: 3px solid rgba(255,255,255,0.3);
+            border-radius: 15px;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.2);
+            background: rgba(0,0,0,0.1);
+        }
+        
+        .controls {
+            margin-bottom: 30px;
+        }
+        
+        button {
+            padding: 12px 25px;
+            margin: 10px;
+            font-size: 1em;
+            font-weight: 600;
+            color: #fff;
+            background: linear-gradient(45deg, #ff6b6b, #ee5a24);
+            border: none;
+            border-radius: 30px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.2);
+        }
+        
+        button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(0,0,0,0.3);
+            background: linear-gradient(45deg, #ee5a24, #ff6b6b);
+        }
+        
+        button:active {
+            transform: translateY(0);
+        }
+        
+        button:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+        }
+        
+        .status {
+            margin-bottom: 20px;
+            font-size: 1.1em;
+            font-weight: 500;
+        }
+        
+        .status.connected {
+            color: #2ecc71;
+        }
+        
+        .status.disconnected {
+            color: #e74c3c;
+        }
+        
+        pre {
+            background: rgba(0, 0, 0, 0.6);
+            padding: 20px;
+            border-radius: 10px;
+            text-align: left;
+            max-width: 100%;
+            margin: 20px auto;
+            overflow: auto;
+            color: #e0f7fa;
+            font-size: 0.9em;
+            line-height: 1.4;
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+        
+        .error {
+            background: rgba(231, 76, 60, 0.8);
+            color: white;
+            padding: 10px;
+            border-radius: 5px;
+            margin: 10px 0;
+            display: none;
+        }
+        
+        @media (max-width: 768px) {
+            .video-container {
+                flex-direction: column;
+                align-items: center;
+            }
+            
+            h1 {
+                font-size: 2em;
+            }
+            
+            button {
+                display: block;
+                margin: 10px auto;
+                width: 200px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎭 Face & Voice Recognition System</h1>
+        
+        <div class="status" id="status">Click "Start Recognition" to begin</div>
+        
+        <div class="video-container">
+            <div>
+                <h3>Live Feed</h3>
+                <video id="video" autoplay muted playsinline></video>
+            </div>
+            <div>
+                <h3>Processed Feed</h3>
+                <img id="processed" alt="Processed video will appear here">
+            </div>
+        </div>
+        
+        <canvas id="canvas" style="display:none;"></canvas>
+        <canvas id="mirrorCanvas" style="display:none;"></canvas>
+        
+        <div class="controls">
+            <button id="startBtn" onclick="start()">🚀 Start Recognition</button>
+            <button id="stopBtn" onclick="stop()" disabled>⏹️ Stop</button>
+            <button id="resultsBtn" onclick="getResults()" disabled>📊 Get Analysis</button>
+        </div>
+        
+        <div class="error" id="error"></div>
+        
+        <pre id="output">Analysis results will appear here...</pre>
+    </div>
+
+    <script>
+        let ws = null;
+        let stream = null;
+        let audioCtx = null;
+        let processor = null;
+        let frameInterval = null;
+        let mirrorInterval = null;
+        let hasCollectedData = false;
+        let isRunning = false;
+        let receivedProcessedFrame = false;
+        
+        const video = document.getElementById('video');
+        const canvas = document.getElementById('canvas');
+        const mirrorCanvas = document.getElementById('mirrorCanvas');
+        const ctx = canvas.getContext('2d');
+        const mirrorCtx = mirrorCanvas.getContext('2d');
+        const status = document.getElementById('status');
+        const startBtn = document.getElementById('startBtn');
+        const stopBtn = document.getElementById('stopBtn');
+        const resultsBtn = document.getElementById('resultsBtn');
+        const errorDiv = document.getElementById('error');
+        const output = document.getElementById('output');
+        const processedImg = document.getElementById('processed');
+
+        function showError(message) {
+            errorDiv.textContent = message;
+            errorDiv.style.display = 'block';
+            setTimeout(() => {
+                errorDiv.style.display = 'none';
+            }, 5000);
+        }
+
+        function updateStatus(message, isConnected = false) {
+            status.textContent = message;
+            status.className = isConnected ? 'status connected' : 'status disconnected';
+        }
+
+        function updateButtons(running, hasData = false) {
+            startBtn.disabled = running;
+            stopBtn.disabled = !running;
+            resultsBtn.disabled = running ? false : !hasData;
+        }
+
+        function startMirrorFeed() {
+            // Mirror the live video feed to the processed side until we get processed frames
+            mirrorInterval = setInterval(() => {
+                if (!receivedProcessedFrame && video.readyState === 4) {
+                    try {
+                        mirrorCanvas.width = 640;
+                        mirrorCanvas.height = 480;
+                        mirrorCtx.drawImage(video, 0, 0, mirrorCanvas.width, mirrorCanvas.height);
+                        
+                        // Add a visual indicator that this is mirrored (not processed yet)
+                        mirrorCtx.strokeStyle = '#ffff00';
+                        mirrorCtx.lineWidth = 3;
+                        mirrorCtx.strokeRect(10, 10, 200, 60);
+                        mirrorCtx.fillStyle = '#ffff00';
+                        mirrorCtx.font = '16px Arial';
+                        mirrorCtx.fillText('WAITING...', 15, 30);
+                        mirrorCtx.font = '12px Arial';
+                        mirrorCtx.fillText('Starting processing', 15, 50);
+                        
+                        mirrorCanvas.toBlob((blob) => {
+                            if (blob && !receivedProcessedFrame) {
+                                const reader = new FileReader();
+                                reader.onloadend = () => {
+                                    if (!receivedProcessedFrame) {
+                                        processedImg.src = reader.result;
+                                    }
+                                };
+                                reader.readAsDataURL(blob);
+                            }
+                        }, 'image/jpeg', 0.8);
+                    } catch (err) {
+                        console.error('Mirror feed error:', err);
+                    }
+                } else if (receivedProcessedFrame && mirrorInterval) {
+                    // Stop mirroring once we receive processed frames
+                    clearInterval(mirrorInterval);
+                    mirrorInterval = null;
+                }
+            }, 100);
+        }
+
+        async function start() {
+            try {
+                updateStatus('Connecting...', false);
+                receivedProcessedFrame = false;
+                
+                // Create WebSocket connection
+                const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                ws = new WebSocket(protocol + '//' + location.host + '/ws');
+                
+                ws.onopen = async () => {
+                    try {
+                        updateStatus('Getting camera and microphone access...', false);
+                        
+                        // Get user media
+                        stream = await navigator.mediaDevices.getUserMedia({ 
+                            video: { 
+                                width: { ideal: 640 }, 
+                                height: { ideal: 480 },
+                                facingMode: 'user'
+                            }, 
+                            audio: {
+                                sampleRate: 16000,
+                                channelCount: 1,
+                                echoCancellation: true,
+                                noiseSuppression: true
+                            }
+                        });
+                        
+                        video.srcObject = stream;
+                        canvas.width = 640;
+                        canvas.height = 480;
+                        
+                        // Wait for video to be ready
+                        await new Promise((resolve) => {
+                            video.onloadedmetadata = resolve;
+                        });
+                        
+                        // Start mirroring the video feed to processed side
+                        startMirrorFeed();
+                        
+                        // Start frame processing
+                        startFrameProcessing();
+                        
+                        // Setup audio processing
+                        setupAudioProcessing();
+                        
+                        isRunning = true;
+                        updateButtons(true, false);
+                        updateStatus('🟢 Recognition active - Processing video and audio', true);
+                        
+                    } catch (err) {
+                        console.error('Media access error:', err);
+                        showError('Camera/microphone access denied or not available');
+                        updateStatus('Failed to access camera/microphone', false);
+                    }
+                };
+                
+                ws.onmessage = (e) => {
+                    try {
+                        const data = JSON.parse(e.data);
+                        
+                        if (data.type === 'video_result') {
+                            receivedProcessedFrame = true;
+                            // Smooth image updates to reduce glitching
+                            processedImg.onload = () => {
+                                processedImg.style.opacity = '1';
+                            };
+                            processedImg.style.opacity = '0.8';
+                            processedImg.src = data.processed_frame;
+                            hasCollectedData = true; // Mark that we have data
+                        } else if (data.type === 'analysis_results') {
+                            output.textContent = JSON.stringify(data, null, 2);
+                            updateStatus('✅ Analysis complete', true);
+                        } else if (data.type === 'error') {
+                            showError('Server error: ' + data.message);
+                        }
+                    } catch (err) {
+                        console.error('Message parsing error:', err);
+                    }
+                };
+                
+                ws.onerror = (err) => {
+                    console.error('WebSocket error:', err);
+                    showError('Connection error occurred');
+                    updateStatus('Connection error', false);
+                };
+                
+                ws.onclose = () => {
+                    if (isRunning) {
+                        updateStatus('Connection lost during recognition', false);
+                        stop();
+                    } else if (hasCollectedData) {
+                        updateStatus('Connection closed - Data available for analysis', true);
+                        updateButtons(false, true);
+                    } else {
+                        updateStatus('Connection closed', false);
+                    }
+                };
+                
+            } catch (err) {
+                console.error('Start error:', err);
+                showError('Failed to start recognition');
+                updateStatus('Failed to start', false);
+            }
+        }
+
+        function startFrameProcessing() {
+            frameInterval = setInterval(() => {
+                if (ws && ws.readyState === WebSocket.OPEN && video.readyState === 4) {
+                    try {
+                        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+                        canvas.toBlob((blob) => {
+                            if (blob) {
+                                const reader = new FileReader();
+                                reader.onloadend = () => {
+                                    if (ws && ws.readyState === WebSocket.OPEN) {
+                                        ws.send(JSON.stringify({ 
+                                            type: 'video_frame', 
+                                            data: reader.result 
+                                        }));
+                                    }
+                                };
+                                reader.readAsDataURL(blob);
+                            }
+                        }, 'image/jpeg', 0.8);
+                    } catch (err) {
+                        console.error('Frame processing error:', err);
+                    }
+                }
+            }, 100); // 10 FPS
+        }
+
+        function setupAudioProcessing() {
+            try {
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)({
+                    sampleRate: 16000  // Ensure consistent sample rate
+                });
+                
+                // Resume audio context if suspended (required by some browsers)
+                if (audioCtx.state === 'suspended') {
+                    audioCtx.resume();
+                }
+                
+                processor = audioCtx.createScriptProcessor(4096, 1, 1);
+                const source = audioCtx.createMediaStreamSource(stream);
+                
+                let audioBuffer = [];
+                let lastSendTime = 0;
+                
+                processor.onaudioprocess = (e) => {
+                    if (ws && ws.readyState === WebSocket.OPEN) {
+                        const inputData = e.inputBuffer.getChannelData(0);
+                        
+                        // Accumulate audio data
+                        audioBuffer = audioBuffer.concat(Array.from(inputData));
+                        
+                        // Send in larger chunks for better voice processing
+                        const now = Date.now();
+                        if (audioBuffer.length >= 16000 && now - lastSendTime > 500) { // 1 second of audio at 16kHz
+                            ws.send(JSON.stringify({ 
+                                type: 'audio_data', 
+                                data: audioBuffer.slice(0, 16000)  // Send 1 second chunks
+                            }));
+                            audioBuffer = audioBuffer.slice(16000);  // Keep remainder
+                            lastSendTime = now;
+                        }
+                    }
+                };
+                
+                source.connect(processor);
+                processor.connect(audioCtx.destination);
+                
+            } catch (err) {
+                console.error('Audio setup error:', err);
+                showError('Audio processing setup failed - voice counting may not work');
+            }
+        }
+
+        function stop() {
+            isRunning = false;
+            receivedProcessedFrame = false;
+            updateButtons(false, hasCollectedData);
+            
+            // Clear intervals
+            if (frameInterval) {
+                clearInterval(frameInterval);
+                frameInterval = null;
+            }
+            
+            if (mirrorInterval) {
+                clearInterval(mirrorInterval);
+                mirrorInterval = null;
+            }
+            
+            // Disconnect audio processing
+            if (processor) {
+                processor.disconnect();
+                processor = null;
+            }
+            
+            if (audioCtx) {
+                audioCtx.close();
+                audioCtx = null;
+            }
+            
+            // Stop media stream
+            if (stream) {
+                stream.getTracks().forEach(track => track.stop());
+                stream = null;
+            }
+            
+            // Clear video
+            video.srcObject = null;
+            
+            // Clear processed image
+            processedImg.src = '';
+            
+            // Keep WebSocket open for analysis if we have data
+            if (!hasCollectedData && ws) {
+                ws.close();
+                ws = null;
+            }
+            
+            const statusMsg = hasCollectedData ? 
+                'Recognition stopped - Click "Get Analysis" to analyze collected data' : 
+                'Recognition stopped';
+            updateStatus(statusMsg, hasCollectedData);
+        }
+
+        function getResults() {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'get_results' }));
+                updateStatus('🔄 Analyzing results...', true);
+            } else if (hasCollectedData) {
+                showError('Connection lost - please restart to analyze data');
+                // Reset everything if connection is lost
+                hasCollectedData = false;
+                updateButtons(false, false);
+                updateStatus('Connection lost', false);
+            } else {
+                showError('No data collected - start recognition first');
+            }
+        }
+
+        // Cleanup on page unload
+        window.addEventListener('beforeunload', stop);
+        
+        // Handle visibility change to pause/resume
+        document.addEventListener('visibilitychange', () => {
+            if (document.hidden && isRunning) {
+                // Optionally pause processing when tab is not visible
+                console.log('Tab hidden, continuing processing...');
+            }
+        });
+    </script>
+</body>
+</html>
+"""
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
